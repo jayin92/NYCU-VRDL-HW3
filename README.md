@@ -34,10 +34,6 @@ The implementation includes:
 git clone https://github.com/jayin92/NYCU-VRDL-HW3.git
 cd NYCU-VRDL-HW3
 
-# Create a virtual environment (optional but recommended)
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
 # Install dependencies
 pip install -r requirements.txt
 ```

@@ -58,7 +58,7 @@ def get_maskrcnn_model(num_classes=2, pretrained=False):
     
     return model
 
-def get_maskrcnn_model_fpnv2(num_classes=2, pretrained=False):
+def get_maskrcnn_model_fpnv2(num_classes=2, pretrained=False, trainable_backbone_layers=3):
     """
     Get a Mask R-CNN model with a ResNet-50-FPN-v2 backbone (better performance).
     
@@ -74,7 +74,7 @@ def get_maskrcnn_model_fpnv2(num_classes=2, pretrained=False):
         weights = torchvision.models.detection.MaskRCNN_ResNet50_FPN_V2_Weights.DEFAULT
     else:
         weights = None
-    model = torchvision.models.detection.maskrcnn_resnet50_fpn_v2(weights=weights)
+    model = torchvision.models.detection.maskrcnn_resnet50_fpn_v2(weights=weights, trainable_backbone_layers=trainable_backbone_layers)
     
     # Get the number of input features for the classifier
     in_features = model.roi_heads.box_predictor.cls_score.in_features

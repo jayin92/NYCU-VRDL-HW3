@@ -10,7 +10,7 @@ import cv2
 from PIL import Image
 from pycocotools import mask as mask_utils
 
-from model import get_maskrcnn_model, get_maskrcnn_model_fpnv2
+from model import get_maskrcnn_model, get_maskrcnn_model_fpnv2, get_maskrcnn_model_convnext, get_maskrcnn_model_swin
 from dataset import MaskRCNNTestDataset, get_transform, collate_fn
 from utils import encode_mask
 
@@ -47,45 +47,18 @@ def main(args):
     # Initialize model
     if args.backbone == "fpn":
         model = get_maskrcnn_model(num_classes=5, pretrained=False)  # 5 classes: background + 4 classes
-    else:  # fpnv2
+    elif args.backbone == "fpnv2":
         model = get_maskrcnn_model_fpnv2(num_classes=5, pretrained=False)  # 5 classes: background + 4 classes
-    
-    # Load model weights with handling for different number of classes
-    try:
-        model.load_state_dict(torch.load(args.model_path, map_location=device))
-    except RuntimeError as e:
-        print(f"Warning: {e}")
-        print("Attempting to load model with different class count...")
-        
-        # Try to load with 2 classes instead
-        if args.backbone == "fpn":
-            model = get_maskrcnn_model(num_classes=2, pretrained=False)
-        else:  # fpnv2
-            model = get_maskrcnn_model_fpnv2(num_classes=2, pretrained=False)
-            
-        model.load_state_dict(torch.load(args.model_path, map_location=device))
-        print("Successfully loaded model with 2 classes.")
-        
-        # Now recreate the model with 5 classes for future training
-        if args.backbone == "fpn":
-            new_model = get_maskrcnn_model(num_classes=5, pretrained=False)
-        else:  # fpnv2
-            new_model = get_maskrcnn_model_fpnv2(num_classes=5, pretrained=False)
-            
-        # Copy weights that match
-        pretrained_dict = model.state_dict()
-        model_dict = new_model.state_dict()
-        
-        # Filter out layers with different shapes
-        pretrained_dict = {k: v for k, v in pretrained_dict.items() 
-                           if k in model_dict and v.shape == model_dict[k].shape}
-        
-        # Update the model with the pretrained weights
-        model_dict.update(pretrained_dict)
-        new_model.load_state_dict(model_dict)
-        
-        # Use the new model
-        model = new_model
+    elif args.backbone == "convnext":
+        print("Using ConvNeXt backbone")
+        model = get_maskrcnn_model_convnext(num_classes=5, variant=args.variant, pretrained=False)  # 5 classes: background + 4 classes
+    elif args.backbone == "swin":
+        model = get_maskrcnn_model_swin(num_classes=5, variant=args.variant, pretrained=False)  # 5 classes: background + 4 classes
+    else:
+        raise ValueError(f"Invalid backbone type: {args.backbone}")
+
+    model.load_state_dict(torch.load(args.model_path, map_location=device))
+
     model.to(device)
     model.eval()
     
@@ -109,6 +82,16 @@ def main(args):
                 orig_img = sio.imread(os.path.join(args.image_dir, image_name))
                 orig_h, orig_w = orig_img.shape[:2]
                 
+                # Handle different image formats
+                if len(orig_img.shape) == 2:  # Grayscale image
+                    orig_img = np.stack([orig_img, orig_img, orig_img], axis=2)
+                elif orig_img.shape[2] == 4:  # RGBA image
+                    # Convert RGBA to RGB
+                    alpha = orig_img[:, :, 3:4] / 255.0
+                    rgb = orig_img[:, :, :3]
+                    background = np.ones_like(rgb) * 255
+                    orig_img = (rgb * alpha + background * (1 - alpha)).astype(np.uint8)
+                
                 # Get predicted masks with score > threshold
                 scores = output['scores'].cpu().numpy()
                 masks = output['masks'].cpu().numpy()
@@ -119,66 +102,67 @@ def main(args):
                 scores = scores[keep]
                 masks = masks[keep]
                 boxes = boxes[keep]
+                class_ids = output['labels'].cpu().numpy()[keep]
                 
                 # Save visualization if requested
                 if args.save_images:
                     # Create a visualization of the predictions
                     vis_img = orig_img.copy()
                     
-                    # Draw each mask with a different color
-                    for j, mask in enumerate(masks):
-                        mask = cv2.resize(mask[0], (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-                        mask = mask > 0.5
+                    # Define fixed colors for each class
+                    class_colors = {
+                        1: [255, 0, 0],    # Red for class 1
+                        2: [0, 255, 0],    # Green for class 2
+                        3: [0, 0, 255],    # Blue for class 3
+                        4: [255, 255, 0],  # Yellow for class 4
+                    }
+                    
+                    # Draw each mask with a class-specific color
+                    for j, (mask, class_id) in enumerate(zip(masks, class_ids)):
+                        # Get binary mask - no need to resize as it's already the correct shape
+                        binary_mask = mask[0] > 0.5
                         
-                        # Create random color
-                        color = np.random.randint(0, 255, size=3, dtype=np.uint8)
+                        # Get color for this class
+                        color = class_colors.get(class_id, [128, 128, 128])  # Default to gray if class not found
+                        color = np.array(color, dtype=np.uint8)
                         
-                        # Apply mask
-                        vis_img[mask] = vis_img[mask] * 0.5 + color * 0.5
+                        # Apply mask properly with broadcasting
+                        for c in range(3):  # For each color channel (RGB only)
+                            vis_img[:,:,c][binary_mask] = vis_img[:,:,c][binary_mask] * 0.5 + color[c] * 0.5
                         
-                        # Draw bounding box
+                        # Draw bounding box (no scaling needed)
                         box = boxes[j]
                         x1, y1, x2, y2 = box
-                        # Scale box to original image size
-                        x1 = int(x1 * orig_w / 512)
-                        y1 = int(y1 * orig_h / 512)
-                        x2 = int(x2 * orig_w / 512)
-                        y2 = int(y2 * orig_h / 512)
+                        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
                         cv2.rectangle(vis_img, (x1, y1), (x2, y2), color.tolist(), 2)
                     
                     # Save visualization
                     cv2.imwrite(
-                        os.path.join(args.output_dir, f"pred_{image_name}.png"),
+                        os.path.join(args.output_dir, "visualizations", f"pred_{image_name}.png"),
                         cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
                     )
                 
                 # Process each mask
-                for j, (score, mask, box) in enumerate(zip(scores, masks, boxes)):
-                    # Resize mask to original image size
-                    mask = cv2.resize(mask[0], (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-                    mask = mask > 0.5
+                for j, (score, mask, box, class_id) in enumerate(zip(scores, masks, boxes, class_ids)):
+                    # Get binary mask - no need to resize as it's already the correct shape
+                    binary_mask = mask[0] > 0.5
                     
                     # Skip masks that are too small
-                    if np.sum(mask) < args.min_area:
+                    if np.sum(binary_mask) < args.min_area:
                         continue
                     
                     # Convert mask to RLE format
-                    rle = mask_to_rle(mask)
+                    rle = mask_to_rle(binary_mask)
                     
-                    # Convert box to COCO format [x, y, width, height]
+                    # Get box coordinates (no need to scale since test images are not resized)
                     x1, y1, x2, y2 = box
-                    # Scale box to original image size
-                    x1 = float(x1 * orig_w / 512)
-                    y1 = float(y1 * orig_h / 512)
-                    x2 = float(x2 * orig_w / 512)
-                    y2 = float(y2 * orig_h / 512)
                     
                     # Add to results
                     results.append({
                         "image_id": image_id,
-                        "bbox": [x1, y1, x2, y2],  # COCO format: [x, y, width, height]
+                        "bbox": [float(x1), float(y1), float(x2-x1), float(y2-y1)],  # COCO format: [x, y, width, height]
                         "score": float(score),
-                        "category_id": 1,  # Always 1 for foreground
+                        "category_id": int(class_id),
                         "segmentation": rle
                     })
     
@@ -194,14 +178,16 @@ if __name__ == "__main__":
     parser.add_argument("--image_dir", type=str, required=True, help="Directory containing test images")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the trained model")
     parser.add_argument("--output_dir", type=str, default="./output", help="Output directory for predictions")
-    parser.add_argument("--backbone", type=str, default="fpn", choices=["fpn", "fpnv2"], help="Backbone type")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Score threshold for predictions")
-    parser.add_argument("--min_area", type=int, default=100, help="Minimum area for a region to be considered")
+    parser.add_argument("--backbone", type=str, default="fpn", choices=["fpn", "fpnv2", "convnext", "swin"], help="Backbone type")
+    parser.add_argument("--variant", type=str, default="base", choices=["tiny", "small", "base", "large"], help="Variant for ConvNeXt or Swin Transformer")
+    parser.add_argument("--threshold", type=float, default=0.0, help="Score threshold for predictions")
+    parser.add_argument("--min_area", type=int, default=0, help="Minimum area for a region to be considered")
     parser.add_argument("--save_images", action="store_true", help="Save prediction images")
     
     args = parser.parse_args()
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, "visualizations"), exist_ok=True)
     
     main(args)

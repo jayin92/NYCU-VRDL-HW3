@@ -9,12 +9,16 @@ from datetime import datetime
 import argparse
 import wandb
 from tqdm import tqdm
+import json
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+from pycocotools import mask as mask_util
 
-from model import get_maskrcnn_model, get_maskrcnn_model_fpnv2
+from model import get_maskrcnn_model, get_maskrcnn_model_fpnv2, get_maskrcnn_model_convnext, get_maskrcnn_model_swin, count_parameters
 from dataset import MaskRCNNDataset, get_transform, collate_fn
 from utils import encode_mask, decode_maskobj
 
-def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=10):
+def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=10, scaler=None, grad_accum_steps=1):
     model.train()
     
     running_loss = 0.0
@@ -23,6 +27,9 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=10)
     running_loss_mask = 0.0
     running_loss_objectness = 0.0
     running_loss_rpn_box_reg = 0.0
+    
+    # Reset gradients at the beginning
+    optimizer.zero_grad()
     
     loop = tqdm(data_loader)
     
@@ -34,17 +41,34 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=10)
         
         losses = sum(loss for loss in loss_dict.values())
         
-        optimizer.zero_grad()
-        losses.backward()
-        optimizer.step()
+        # Normalize the loss to account for gradient accumulation
+        losses = losses / grad_accum_steps
         
-        # Update running losses
-        running_loss += losses.item()
-        running_loss_classifier += loss_dict['loss_classifier'].item()
-        running_loss_box_reg += loss_dict['loss_box_reg'].item()
-        running_loss_mask += loss_dict['loss_mask'].item()
-        running_loss_objectness += loss_dict['loss_objectness'].item()
-        running_loss_rpn_box_reg += loss_dict['loss_rpn_box_reg'].item()
+        if scaler is not None:
+            # Use mixed precision training
+            with torch.cuda.amp.autocast():
+                scaler.scale(losses).backward()
+        else:
+            # Standard full precision training
+            losses.backward()
+        
+        # Only step and update gradients after accumulating for grad_accum_steps
+        if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(data_loader):
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
+        
+        # Track losses (use the non-normalized loss for logging)
+        batch_loss = losses.item() * grad_accum_steps
+        running_loss += batch_loss
+        running_loss_classifier += loss_dict['loss_classifier'].item() if 'loss_classifier' in loss_dict else 0
+        running_loss_box_reg += loss_dict['loss_box_reg'].item() if 'loss_box_reg' in loss_dict else 0
+        running_loss_mask += loss_dict['loss_mask'].item() if 'loss_mask' in loss_dict else 0
+        running_loss_objectness += loss_dict['loss_objectness'].item() if 'loss_objectness' in loss_dict else 0
+        running_loss_rpn_box_reg += loss_dict['loss_rpn_box_reg'].item() if 'loss_rpn_box_reg' in loss_dict else 0
         
         # Update tqdm loop
         loop.set_postfix(loss=losses.item())
@@ -73,53 +97,106 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=10)
 def evaluate(model, data_loader, device):
     model.eval()
     
-    # Placeholder for metrics
-    # In a real evaluation, you would calculate mAP, IoU, etc.
-    # For simplicity, we'll just count correct detections
+    # Initialize lists to store predictions and ground truth in COCO format
+    coco_gt = {'images': [], 'annotations': [], 'categories': []}
+    coco_dt = []
     
-    total_masks = 0
-    correct_masks = 0
+    # Setup categories for COCO format
+    for i in range(1, 5):  # Classes 1-4
+        coco_gt['categories'].append({
+            'id': i,
+            'name': f'class{i}',
+            'supercategory': 'cell'
+        })
+    
+    ann_id = 0
+    img_id = 0
     
     for images, targets in tqdm(data_loader, desc="Evaluating"):
         images = list(image.to(device) for image in images)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
         
         # Get predictions
         outputs = model(images)
         
-        # Compare predictions with targets
-        for i, (output, target) in enumerate(zip(outputs, targets)):
-            # Get predicted masks with score > 0.5
-            pred_masks = output['masks'][output['scores'] > 0.5]
-            pred_masks = (pred_masks > 0.5).squeeze(1)
+        for i, (image, target, output) in enumerate(zip(images, targets, outputs)):
+            # Image info for COCO format
+            h, w = image.shape[-2:]
+            coco_gt['images'].append({
+                'id': img_id,
+                'width': w,
+                'height': h,
+                'file_name': f'img_{img_id}.jpg'
+            })
             
-            # Get target masks
-            target_masks = target['masks']
+            # Convert ground truth to COCO format
+            target_masks = target['masks'].cpu().numpy()
+            target_labels = target['labels'].cpu().numpy()
+            target_boxes = target['boxes'].cpu().numpy()
             
-            # Count masks
-            total_masks += len(target_masks)
-            
-            # For each target mask, find the best matching predicted mask
-            for target_mask in target_masks:
-                if len(pred_masks) == 0:
-                    continue
+            for mask, label, box in zip(target_masks, target_labels, target_boxes):
+                rle = mask_util.encode(np.asfortranarray(mask.astype(np.uint8)))
+                rle['counts'] = rle['counts'].decode('utf-8')
+                area = mask_util.area(rle).item()
+                x1, y1, x2, y2 = box
                 
-                # Calculate IoU for each predicted mask
-                ious = []
-                for pred_mask in pred_masks:
-                    intersection = (pred_mask & target_mask).sum().float()
-                    union = (pred_mask | target_mask).sum().float()
-                    iou = intersection / (union + 1e-8)
-                    ious.append(iou)
+                coco_gt['annotations'].append({
+                    'id': ann_id,
+                    'image_id': img_id,
+                    'category_id': int(label),
+                    'segmentation': rle,
+                    'area': area,
+                    'bbox': [x1, y1, x2 - x1, y2 - y1],
+                    'iscrowd': 0
+                })
                 
-                # If any predicted mask has IoU > 0.5, count as correct
-                if max(ious) > 0.5:
-                    correct_masks += 1
+                ann_id += 1
+            
+            # Convert predictions to COCO format
+            pred_masks = output['masks'].cpu()
+            pred_labels = output['labels'].cpu().numpy()
+            pred_scores = output['scores'].cpu().numpy()
+            pred_boxes = output['boxes'].cpu().numpy()
+            
+            for mask, label, score, box in zip(pred_masks, pred_labels, pred_scores, pred_boxes):
+                mask = (mask > 0.5).squeeze().numpy().astype(np.uint8)
+                rle = mask_util.encode(np.asfortranarray(mask))
+                rle['counts'] = rle['counts'].decode('utf-8')
+                area = mask_util.area(rle).item()
+                x1, y1, x2, y2 = box
+                
+                coco_dt.append({
+                    'image_id': img_id,
+                    'category_id': int(label),
+                    'segmentation': rle,
+                    'score': float(score),
+                    'area': area,
+                    'bbox': [x1, y1, x2 - x1, y2 - y1]
+                })
+            
+            img_id += 1
     
-    # Calculate accuracy
-    mask_accuracy = correct_masks / total_masks if total_masks > 0 else 0
+    # Calculate mAP using pycocotools
+    coco_gt_obj = COCO()
+    coco_gt_obj.dataset = coco_gt
+    coco_gt_obj.createIndex()
     
-    return {'mask_accuracy': mask_accuracy}
+    coco_dt_obj = coco_gt_obj.loadRes(coco_dt)
+    
+    coco_eval = COCOeval(coco_gt_obj, coco_dt_obj, 'segm')
+    coco_eval.evaluate()
+    coco_eval.accumulate()
+    coco_eval.summarize()
+    
+    # Get mAP values
+    ap50 = coco_eval.stats[1]  # AP at IoU=0.50
+    ap75 = coco_eval.stats[2]  # AP at IoU=0.75
+    map = coco_eval.stats[0]   # mAP@[0.5:0.95]
+    
+    return {
+        'mAP': map,
+        'AP50': ap50,
+        'AP75': ap75
+    }
 
 def visualize_predictions(model, data_loader, device, output_dir, num_images=5):
     model.eval()
@@ -167,17 +244,22 @@ def visualize_predictions(model, data_loader, device, output_dir, num_images=5):
                 axs[0, 0].set_title('Original Image')
                 axs[0, 0].axis('off')
                 
-                # Plot ground truth masks for all classes
-                axs[0, 1].imshow(img)
-                for mask, label in zip(target_masks, target_labels):
-                    # Get color for this class
-                    color = class_colors[label.item()]
-                    # Create colored mask
-                    colored_mask = np.zeros((mask.shape[0], mask.shape[1], 3))
-                    for c in range(3):
-                        colored_mask[..., c] = np.where(mask == 1, color[c], 0)
-                    # Overlay mask on image
-                    axs[0, 1].imshow(colored_mask, alpha=0.5)
+                # Plot ground truth masks - FIX: Create separate image for each class to avoid overlap
+                gt_img = img.copy()
+                axs[0, 1].imshow(gt_img)
+                
+                # Create a separate mask image for each class
+                for class_id in range(1, 5):
+                    class_mask = np.zeros_like(gt_img)
+                    for mask, label in zip(target_masks, target_labels):
+                        if label == class_id:
+                            color = class_colors[label.item()]
+                            for c in range(3):
+                                class_mask[..., c] = np.where(mask == 1, color[c], class_mask[..., c])
+                    
+                    # Only overlay if there are actual masks for this class
+                    if np.any(class_mask > 0):
+                        axs[0, 1].imshow(class_mask, alpha=0.5)
                 
                 # Add legend for ground truth
                 legend_elements = [plt.Line2D([0], [0], marker='o', color='w', 
@@ -188,17 +270,22 @@ def visualize_predictions(model, data_loader, device, output_dir, num_images=5):
                 axs[0, 1].set_title('Ground Truth Masks')
                 axs[0, 1].axis('off')
                 
-                # Plot predicted masks for all classes
-                axs[1, 0].imshow(img)
-                for mask, label in zip(pred_masks, pred_labels):
-                    # Get color for this class
-                    color = class_colors[label.item()]
-                    # Create colored mask
-                    colored_mask = np.zeros((mask.shape[0], mask.shape[1], 3))
-                    for c in range(3):
-                        colored_mask[..., c] = np.where(mask == 1, color[c], 0)
-                    # Overlay mask on image
-                    axs[1, 0].imshow(colored_mask, alpha=0.5)
+                # Plot predicted masks - using the same fix as above
+                pred_img = img.copy()
+                axs[1, 0].imshow(pred_img)
+                
+                # Create a separate mask image for each class
+                for class_id in range(1, 5):
+                    class_mask = np.zeros_like(pred_img)
+                    for mask, label in zip(pred_masks, pred_labels):
+                        if label == class_id:
+                            color = class_colors[label.item()]
+                            for c in range(3):
+                                class_mask[..., c] = np.where(mask == 1, color[c], class_mask[..., c])
+                    
+                    # Only overlay if there are actual masks for this class
+                    if np.any(class_mask > 0):
+                        axs[1, 0].imshow(class_mask, alpha=0.5)
                 
                 # Add legend for predictions
                 axs[1, 0].legend(handles=legend_elements, loc='upper right')
@@ -260,9 +347,12 @@ def main(args):
             config={
                 "backbone": args.backbone,
                 "class_id": args.class_id,
+                "trainable_backbone_layers": args.trainable_backbone_layers,
                 "batch_size": args.batch_size,
                 "learning_rate": args.learning_rate,
                 "num_epochs": args.num_epochs,
+                "mixed_precision": args.mixed_precision,
+                "grad_accum_steps": args.grad_accum_steps,
             }
         )
     
@@ -279,7 +369,7 @@ def main(args):
     
     # Split dataset into train and validation sets
     dataset_size = len(full_dataset)
-    val_size = int(dataset_size * 0.1)  # 10% for validation
+    val_size = int(dataset_size * 0.05)  # 10% for validation
     train_size = dataset_size - val_size
     
     train_ds, val_ds = random_split(
@@ -313,11 +403,40 @@ def main(args):
     )
     
     # Initialize model
-    if args.backbone == "fpn":
-        model = get_maskrcnn_model(num_classes=5, pretrained=True, trainable_backbone_layers=args.trainable_backbone_layers)  # 5 classes: background + 4 classes
-    else:  # fpnv2
-        model = get_maskrcnn_model_fpnv2(num_classes=5, pretrained=True, trainable_backbone_layers=args.trainable_backbone_layers)  # 5 classes: background + 4 classes
+    num_classes = 5
+    if args.backbone == 'resnet':
+        model = get_maskrcnn_model(
+            num_classes=num_classes,
+            trainable_backbone_layers=args.trainable_backbone_layers
+        )
+    elif args.backbone == 'fpnv2':
+        model = get_maskrcnn_model_fpnv2(
+            num_classes=num_classes,
+            trainable_backbone_layers=args.trainable_backbone_layers
+        )
+    elif args.backbone == 'convnext':
+        model = get_maskrcnn_model_convnext(
+            num_classes=num_classes,
+            variant=args.variant,
+            pretrained=True,
+            trainable_backbone_layers=args.trainable_backbone_layers
+        )
+    elif args.backbone == 'swin':
+        model = get_maskrcnn_model_swin(
+            num_classes=num_classes,
+            variant=args.variant,
+            pretrained=True,
+            trainable_backbone_layers=args.trainable_backbone_layers
+        )
+    else:
+        raise ValueError(f"Unsupported backbone: {args.backbone}")
+        
+    # Print model parameter count
+    print(f"Total parameters: {count_parameters(model):,}")
+    print(f"Trainable parameters: {count_parameters(model, only_trainable=True):,}")
+    print(f"Percentage trainable: {count_parameters(model, only_trainable=True)/count_parameters(model)*100:.2f}%")
     
+    print(f"Model has {count_parameters(model)/1e6:.2f}M parameters")
     model.to(device)
     
     # Define optimizer
@@ -330,12 +449,20 @@ def main(args):
             momentum=0.9,
             weight_decay=0.0005
         )
-    else:  # adam
+    elif args.optimizer == 'adam':
         optimizer = torch.optim.Adam(
             params,
             lr=args.learning_rate,
             weight_decay=0.0005
         )
+    elif args.optimizer == 'adamw':
+        optimizer = torch.optim.AdamW(
+            params,
+            lr=args.learning_rate,
+            weight_decay=0.0005
+        )
+    else:
+        raise ValueError(f"Unknown optimizer: {args.optimizer}")
     
     # Learning rate scheduler - Cosine Annealing for smoother decay
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -344,20 +471,30 @@ def main(args):
         eta_min=1e-6  # Minimum learning rate
     )
     
+    # Initialize mixed precision scaler if enabled
+    scaler = torch.cuda.amp.GradScaler() if args.mixed_precision else None
+    
     # Training loop
-    best_accuracy = 0.0
+    best_map = 0.0
     for epoch in range(args.num_epochs):
         print(f"Epoch {epoch+1}/{args.num_epochs}")
         
         # Train for one epoch
-        train_metrics = train_one_epoch(model, optimizer, train_loader, device, epoch)
+        train_metrics = train_one_epoch(
+            model, optimizer, train_loader, device, epoch,
+            scaler=scaler, grad_accum_steps=args.grad_accum_steps
+        )
         
         # Update learning rate
         lr_scheduler.step()
         
         # Evaluate on validation set
         val_metrics = evaluate(model, val_loader, device)
-        print(f"Validation accuracy: {val_metrics['mask_accuracy']:.4f}")
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        print(f"Validation mAP: {val_metrics['mAP']:.4f}, AP50: {val_metrics['AP50']:.4f}, AP75: {val_metrics['AP75']:.4f}")
         
         # Log metrics to wandb
         if args.use_wandb:
@@ -368,11 +505,11 @@ def main(args):
                 "learning_rate": optimizer.param_groups[0]['lr']
             })
         
-        # Save best model
-        if val_metrics['mask_accuracy'] > best_accuracy:
-            best_accuracy = val_metrics['mask_accuracy']
+        # Save best model based on mAP
+        if val_metrics['mAP'] > best_map:
+            best_map = val_metrics['mAP']
             torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pth"))
-            print(f"Saved best model with accuracy: {best_accuracy:.4f}")
+            print(f"Saved best model with mAP: {best_map:.4f}")
             
             if args.use_wandb:
                 # Save model to wandb
@@ -386,7 +523,7 @@ def main(args):
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': lr_scheduler.state_dict(),
-            'best_accuracy': best_accuracy,
+            'best_map': best_map,
         }, os.path.join(args.output_dir, "checkpoint.pth"))
         
         # Visualize predictions every 5 epochs
@@ -399,17 +536,23 @@ def main(args):
                 num_images=5
             )
 
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a Mask R-CNN model")
     parser.add_argument("--data_dir", type=str, required=True, help="Directory containing training data folders")
     parser.add_argument("--output_dir", type=str, default="./output", help="Output directory for models and predictions")
-    parser.add_argument("--backbone", type=str, default="fpn", choices=["fpn", "fpnv2"], help="Backbone type")
+    parser.add_argument("--backbone", type=str, default="fpn", choices=["fpn", "fpnv2", "convnext", "swin"], help="Backbone type")
+    parser.add_argument("--variant", type=str, default="base", choices=["tiny", "small", "base", "large"], help="Variant for ConvNeXt or Swin Transformer") 
     parser.add_argument("--class_id", type=int, default=2, choices=[1, 2], help="Class ID to use for training (1 or 2)")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
     parser.add_argument("--learning_rate", type=float, default=0.005, help="Learning rate")
     parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs")
     parser.add_argument("--trainable_backbone_layers", type=int, default=3, choices=[0, 1, 2, 3, 4, 5], help="Number of trainable backbone layers")
-    parser.add_argument("--optimizer", type=str, default="sgd", choices=["sgd", "adam"], help="Optimizer to use (sgd or adam)")
+    parser.add_argument("--optimizer", type=str, default="sgd", choices=["sgd", "adam", "adamw"], help="Optimizer to use (sgd, adam, or adamw)")
+    parser.add_argument("--mixed_precision", action="store_true", help="Use mixed precision training to reduce memory usage")
+    parser.add_argument("--grad_accum_steps", type=int, default=1, help="Number of gradient accumulation steps")
     
     # Wandb arguments
     parser.add_argument("--use_wandb", action="store_true", help="Enable wandb logging")
